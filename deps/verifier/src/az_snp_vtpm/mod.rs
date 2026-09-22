@@ -421,9 +421,12 @@ pub(crate) fn parse_tee_evidence_az(report: &AttestationReport) -> TeeEvidencePa
 mod tests {
     use super::*;
     use crate::extend_eventlog_claim;
+    use openssl::rsa::Rsa;
+    use openssl::x509::X509Builder;
     use rstest::rstest;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const REPORT: &[u8; 2600] = include_bytes!("../../test_data/az-snp-vtpm/hcl-report.bin");
     const TPM_QUOTE_V1_JSON: &str = include_str!("../../test_data/az-snp-vtpm/tpm-quote-v1.json");
@@ -592,6 +595,34 @@ mod tests {
             .expect("Genoa VCEK should validate against Genoa certificate chain");
         verify_vcek_validity_window(&vcek)
             .expect("Genoa VCEK should be inside its validity window");
+    }
+
+    /// A self-signed cert whose validity window is the given day offsets from
+    /// now. Built here rather than checked in so the window always straddles
+    /// the current clock and cannot age into the wrong answer.
+    fn cert_valid_between(not_before: i64, not_after: i64) -> Certificate {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let at = |days: i64| Asn1Time::from_unix(now + days * 86_400).unwrap();
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder.set_not_before(&at(not_before)).unwrap();
+        builder.set_not_after(&at(not_after)).unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+
+        Certificate::from_pem(&builder.build().to_pem().unwrap()).unwrap()
+    }
+
+    /// Both reject paths, which the real VCEKs cannot reach while current.
+    #[rstest]
+    #[case::expired(-730, -365)]
+    #[case::not_yet_valid(365, 730)]
+    fn test_vcek_outside_validity_window_rejected(#[case] not_before: i64, #[case] not_after: i64) {
+        assert!(verify_vcek_validity_window(&cert_valid_between(not_before, not_after)).is_err());
     }
 
     #[test]
