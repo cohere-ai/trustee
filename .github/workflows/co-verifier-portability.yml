@@ -25,7 +25,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Assert tss-esapi is absent
+      - name: Assert tss-esapi is absent from the dependency graph
         run: |
           cargo tree -p verifier --no-default-features \
             --features az-snp-vtpm-verifier > tree.txt
@@ -34,7 +34,16 @@ jobs:
             exit 1
           fi
 
-      # No libtss2-dev is installed, which is what makes this meaningful: the
-      # wheel enables this feature on macOS, where libtss2 cannot be built.
+      # The build below only proves anything while libtss2 is absent, so fail
+      # loudly rather than silently weaken if a runner image starts shipping it.
+      - name: Assert libtss2 is absent from the runner
+        run: |
+          if pkg-config --exists tss2-esys; then
+            echo "::error::libtss2 is installed; the build no longer proves portability"
+            exit 1
+          fi
+
+      # Stands in for target env, where libtss2 cannot be built at all and the packaging
+      # enables this feature regardless.
       - name: Build
         run: cargo build -p verifier --no-default-features --features az-snp-vtpm-verifier
