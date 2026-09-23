@@ -58,6 +58,21 @@ pub(super) enum Evidence {
     V0(EvidenceV0),
 }
 
+/// `az_tdx_vtpm::vtpm::Quote` re-exports `az-cvm-vtpm`'s type, whose fields are
+/// private -- hence the accessors. A single impl in `az_snp_vtpm` used to cover
+/// both paths, since that module imported the same re-export; it has its own
+/// local `Quote` now. This cannot move back: naming this type there would relink
+/// libtss2 into the SNP path.
+impl From<Quote> for TpmQuote {
+    fn from(quote: Quote) -> Self {
+        TpmQuote {
+            signature: quote.signature(),
+            message: quote.message(),
+            pcrs: quote.pcrs_sha256().map(|p| p.to_vec()).collect(),
+        }
+    }
+}
+
 impl Evidence {
     pub(super) fn hcl_report(&self) -> &[u8] {
         match self {

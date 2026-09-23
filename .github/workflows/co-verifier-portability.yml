@@ -1,0 +1,49 @@
+name: Verifier Portability
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  az-snp-vtpm:
+    name: az-snp-vtpm-verifier builds without libtss2
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Assert tss-esapi is absent from the dependency graph
+        run: |
+          cargo tree -p verifier --no-default-features \
+            --features az-snp-vtpm-verifier > tree.txt
+          if grep tss-esapi tree.txt; then
+            echo "::error::az-snp-vtpm-verifier must not pull tss-esapi"
+            exit 1
+          fi
+
+      # The build below only proves anything while libtss2 is absent, so fail
+      # loudly rather than silently weaken if a runner image starts shipping it.
+      - name: Assert libtss2 is absent from the runner
+        run: |
+          if pkg-config --exists tss2-esys; then
+            echo "::error::libtss2 is installed; the build no longer proves portability"
+            exit 1
+          fi
+
+      # Stands in for target env, where libtss2 cannot be built at all and the packaging
+      # enables this feature regardless.
+      - name: Build
+        run: cargo build -p verifier --no-default-features --features az-snp-vtpm-verifier

@@ -7,38 +7,31 @@ pub(crate) mod compat;
 
 use self::compat::Evidence;
 use super::{TeeClass, TeeEvidence, TeeEvidenceParsedClaim, Verifier};
-use crate::snp::{
-    get_common_name, get_oid_int, get_oid_octets, get_processor_generation, CERT_CHAINS, HW_ID_OID,
-    LOADER_SPL_OID, SNP_SPL_OID, TEE_SPL_OID, UCODE_SPL_OID,
-};
+use crate::snp::{get_processor_generation, verify_report_tcb, ProcessorGeneration, CERT_CHAINS};
 use crate::{InitDataHash, ReportData};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use az_snp_vtpm::certs::{AmdChain, Vcek};
-use az_snp_vtpm::hcl::HclReport;
-use az_snp_vtpm::report::AttestationReport;
-use az_snp_vtpm::vtpm::QuoteError;
+use az_cvm_vtpm::hcl::HclReport;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 pub(crate) use compat::TpmQuote;
 use eventlog::{ccel::tcg_enum::TcgAlgorithm, CcEventLog, ReferenceMeasurement};
+use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::sign::Verifier as OsslVerifier;
 use openssl::x509::X509;
-use openssl::{ec::EcKey, ecdsa, sha::sha384};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sev::parser::ByteParser;
+use sev::certs::snp::{ca::Chain as CaChain, Certificate, Chain, Verifiable};
+use sev::firmware::guest::AttestationReport;
 use thiserror::Error;
+use tpm2_protocol::data::{TpmsAttest, TpmuAttest};
+use tpm2_protocol::TpmUnmarshal;
 use tracing::{debug, instrument, warn};
-use tss_esapi::structures::{Attest, AttestInfo};
-use tss_esapi::traits::UnMarshall;
-use x509_parser::prelude::*;
 
 const HCL_VMPL_VALUE: u32 = 0;
 const INITDATA_PCR: usize = 8;
-const SNP_REPORT_SIGNATURE_OFFSET: usize = 0x2a0; // 672 bytes
 const SHA256_LEN: usize = 32;
 
 /// vTPM DRTM measurement registers (PCR17-22, per the TCG PC Client
@@ -80,8 +73,6 @@ pub enum CertError {
     #[error("VMPL of SNP report is not {0}")]
     VmplIncorrect(u32),
     #[error(transparent)]
-    Quote(#[from] QuoteError),
-    #[error(transparent)]
     JsonWebkey(#[from] jsonwebkey::ConversionError),
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
@@ -107,9 +98,26 @@ pub(crate) fn extend_claim(claim: &mut TeeEvidenceParsedClaim, tpm_quote: &TpmQu
     Ok(())
 }
 
+/// Parse a quote message as a `TPMS_ATTEST`. Rejects any structure whose
+/// leading magic is not `TPM_GENERATED_VALUE`, i.e. one the TPM did not
+/// produce itself.
+fn parse_attest(message: &[u8]) -> Result<TpmsAttest> {
+    let (attest, _) = TpmsAttest::unmarshal(message)
+        .map_err(|e| anyhow!("Failed to parse TPM quote message: {e:?}"))?;
+    Ok(attest)
+}
+
 fn extract_nonce(message: &[u8]) -> Result<Vec<u8>> {
-    let attest = Attest::unmarshall(message).context("Failed to parse TPM quote message")?;
-    Ok(attest.extra_data().to_vec())
+    Ok(parse_attest(message)?.extra_data.to_vec())
+}
+
+/// The `pcrDigest` the TPM signed over, read out of the quote's
+/// `TPMS_QUOTE_INFO`.
+fn quoted_pcr_digest(message: &[u8]) -> Result<Vec<u8>> {
+    let TpmuAttest::Quote(info) = parse_attest(message)?.attested else {
+        bail!("TPM attestation is not a quote");
+    };
+    Ok(info.pcr_digest.to_vec())
 }
 
 /// Decode and verify the AAEL runtime eventlog against `tpm_quote` (if
@@ -233,7 +241,7 @@ impl Verifier for AzSnpVtpm {
             compat::Vcek::Pem(pem) => pem,
             compat::Vcek::Der(der) => X509::from_der(&der).context("Invalid VCEK DER")?,
         };
-        let vcek = Vcek(vcek_x509);
+        let vcek = Certificate::from(vcek_x509);
 
         let snp_report = hcl_report.try_into()?;
         let proc_gen =
@@ -243,18 +251,20 @@ impl Verifier for AzSnpVtpm {
             return Err(CertError::VcekValidationFailed(format!("{:?}", proc_gen)).into());
         };
 
-        let amd_chain = AmdChain {
-            ask: vendor_certs.ask.clone().into(),
-            ark: vendor_certs.ark.clone().into(),
+        let chain = Chain {
+            ca: CaChain {
+                ark: vendor_certs.ark.clone(),
+                ask: vendor_certs.ask.clone(),
+            },
+            vek: vcek.clone(),
         };
-        amd_chain
-            .validate()
-            .context("Failed to validate CA chain")?;
-        vcek.validate(&amd_chain)
-            .context("Failed to validate VCEK")?;
+        chain
+            .verify()
+            .context("Failed to validate VCEK against AMD CA chain")?;
+        verify_vcek_validity_window(&vcek)?;
         debug!("VCEK validated against {:?} certificate chain", proc_gen);
 
-        verify_snp_report(&snp_report, &vcek)?;
+        verify_snp_report(&snp_report, vcek, proc_gen)?;
 
         let pcrs = get_pcrs(tpm_quote)?;
         let pcr_refs: Vec<&[u8; 32]> = pcrs.iter().collect();
@@ -306,11 +316,7 @@ pub(crate) fn verify_tpm_signature(tpm_quote: &TpmQuote, hcl_report: &HclReport)
 }
 
 pub(crate) fn verify_tpm_pcrs(tpm_quote: &TpmQuote) -> Result<()> {
-    let attest = Attest::unmarshall(&tpm_quote.message).context("Failed to parse TPM message")?;
-    let AttestInfo::Quote { info } = attest.attested() else {
-        bail!("TPM attestation is not a quote");
-    };
-    let expected_digest = info.pcr_digest();
+    let expected_digest = quoted_pcr_digest(&tpm_quote.message)?;
 
     let mut hasher = openssl::sha::Sha256::new();
     for pcr in &tpm_quote.pcrs {
@@ -325,64 +331,36 @@ pub(crate) fn verify_tpm_pcrs(tpm_quote: &TpmQuote) -> Result<()> {
     Ok(())
 }
 
-fn verify_snp_report(snp_report: &AttestationReport, vcek: &Vcek) -> Result<(), CertError> {
-    verify_report_signature(snp_report, vcek)?;
-
-    if snp_report.vmpl != HCL_VMPL_VALUE {
-        return Err(CertError::VmplIncorrect(HCL_VMPL_VALUE));
+/// Reject a VCEK that is expired or not yet valid.
+///
+/// `sev`'s chain verification checks signatures only, so this has to be done
+/// separately or an expired VCEK would still pass.
+fn verify_vcek_validity_window(vcek: &Certificate) -> Result<()> {
+    let vcek: &X509 = vcek.into();
+    let now = Asn1Time::days_from_now(0).context("Failed to read the current time")?;
+    let validity = vcek.not_before()..vcek.not_after();
+    if !validity.contains(&now) {
+        bail!("VCEK is not valid at verification time");
     }
-
     Ok(())
 }
 
-/// Verifies the signature of the attestation report using the provided certificate chain and vendor certificates.
-fn verify_report_signature(report: &AttestationReport, vcek: &Vcek) -> Result<()> {
-    // OpenSSL bindings do not expose custom extensions
-    // Parse the key using x509_parser
+fn verify_snp_report(
+    snp_report: &AttestationReport,
+    vcek: Certificate,
+    proc_gen: ProcessorGeneration,
+) -> Result<(), CertError> {
+    (&vcek, snp_report)
+        .verify()
+        .context("Signature validation failed")?;
 
-    let endorsement_key_der = &vcek.0.to_der()?;
-    let parsed_endorsement_key = X509Certificate::from_der(endorsement_key_der)?
-        .1
-        .tbs_certificate;
+    // Cross-checks the report's TCB and chip ID against the VCEK's x509
+    // extensions. Shared with the SNP verifier, which is what brings the
+    // Turin-only FMC check along with it.
+    verify_report_tcb(snp_report, vcek, proc_gen)?;
 
-    let common_name = get_common_name(&vcek.0).context("No common name found in certificate")?;
-
-    // if the common name is "VCEK", then the key is a VCEK
-    // so lets check the chip id
-    if common_name == "VCEK"
-        && get_oid_octets::<64>(&parsed_endorsement_key, HW_ID_OID)? != report.chip_id
-    {
-        bail!("Chip ID mismatch");
-    }
-
-    // tcb version
-    // these integer extensions are 3 bytes with the last byte as the data
-    if get_oid_int(&parsed_endorsement_key, UCODE_SPL_OID)? != report.reported_tcb.microcode {
-        bail!("Microcode version mismatch");
-    }
-
-    if get_oid_int(&parsed_endorsement_key, SNP_SPL_OID)? != report.reported_tcb.snp {
-        bail!("SNP version mismatch");
-    }
-
-    if get_oid_int(&parsed_endorsement_key, TEE_SPL_OID)? != report.reported_tcb.tee {
-        bail!("TEE version mismatch");
-    }
-
-    if get_oid_int(&parsed_endorsement_key, LOADER_SPL_OID)? != report.reported_tcb.bootloader {
-        bail!("Boot loader version mismatch");
-    }
-
-    // verify report signature
-    let sig = ecdsa::EcdsaSig::try_from(&report.signature)?;
-    // Get the offset of the signature field in the report struct
-    let raw_report_bytes = report.to_bytes().context("Failed to write report bytes")?;
-    let data = &raw_report_bytes[..SNP_REPORT_SIGNATURE_OFFSET];
-
-    let pub_key = EcKey::try_from(vcek.0.public_key()?)?;
-    let signed = sig.verify(&sha384(data), &pub_key)?;
-    if !signed {
-        bail!("Signature validation failed.");
+    if snp_report.vmpl != HCL_VMPL_VALUE {
+        return Err(CertError::VmplIncorrect(HCL_VMPL_VALUE));
     }
 
     Ok(())
@@ -443,9 +421,12 @@ pub(crate) fn parse_tee_evidence_az(report: &AttestationReport) -> TeeEvidencePa
 mod tests {
     use super::*;
     use crate::extend_eventlog_claim;
+    use openssl::rsa::Rsa;
+    use openssl::x509::X509Builder;
     use rstest::rstest;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const REPORT: &[u8; 2600] = include_bytes!("../../test_data/az-snp-vtpm/hcl-report.bin");
     const TPM_QUOTE_V1_JSON: &str = include_str!("../../test_data/az-snp-vtpm/tpm-quote-v1.json");
@@ -511,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_user_data(#[case] tampered_evidence_json: &str) {
         let report_data = hex::decode(EVIDENCE_V2_REPORT_DATA).unwrap();
-        let evidence: Evidence = serde_json::from_str(&tampered_evidence_json).unwrap();
+        let evidence: Evidence = serde_json::from_str(tampered_evidence_json).unwrap();
         let hcl_report = HclReport::new(evidence.hcl_report().into()).unwrap();
         verify_user_data(&hcl_report, &report_data).unwrap();
 
@@ -547,67 +528,101 @@ mod tests {
         );
     }
 
+    /// `vcek.pem` is issued by SEV-Milan. Stated rather than derived from
+    /// `REPORT`, because that fixture is a v3+ report with no CPU family ID
+    /// and `get_processor_generation` cannot classify it.
+    const MILAN_FIXTURE_GENERATION: ProcessorGeneration = ProcessorGeneration::Milan;
+
+    fn load_vcek(pem: &str) -> Certificate {
+        Certificate::from_pem(pem.as_bytes()).expect("Failed to parse VCEK")
+    }
+
+    /// The ARK -> ASK -> VCEK chain for one processor generation.
+    fn cert_chain(proc_gen: &ProcessorGeneration, vcek: &Certificate) -> Chain {
+        let vendor_certs = CERT_CHAINS
+            .get(proc_gen)
+            .expect("certificate chain should be present");
+        Chain {
+            ca: CaChain {
+                ark: vendor_certs.ark.clone(),
+                ask: vendor_certs.ask.clone(),
+            },
+            vek: vcek.clone(),
+        }
+    }
+
     #[test]
     fn test_verify_snp_report() {
         let hcl_report = HclReport::new(REPORT.to_vec()).unwrap();
-        let snp_report = hcl_report.try_into().unwrap();
-        let vcek = Vcek::from_pem(include_str!("../../test_data/az-snp-vtpm/vcek.pem")).unwrap();
+        let snp_report: AttestationReport = hcl_report.try_into().unwrap();
+        let vcek = load_vcek(include_str!("../../test_data/az-snp-vtpm/vcek.pem"));
 
         // Try to validate VCEK against all known certificate chains
-        let validated = CERT_CHAINS.iter().any(|(_proc_gen, vendor_certs)| {
-            let amd_chain = AmdChain {
-                ask: vendor_certs.ask.clone().into(),
-                ark: vendor_certs.ark.clone().into(),
-            };
-            amd_chain.validate().is_ok() && vcek.validate(&amd_chain).is_ok()
-        });
+        let validated = CERT_CHAINS
+            .keys()
+            .any(|proc_gen| cert_chain(proc_gen, &vcek).verify().is_ok());
         assert!(
             validated,
             "VCEK should validate against at least one certificate chain"
         );
+        verify_vcek_validity_window(&vcek).unwrap();
 
-        verify_snp_report(&snp_report, &vcek).unwrap();
+        verify_snp_report(&snp_report, vcek, MILAN_FIXTURE_GENERATION).unwrap();
     }
 
     #[test]
     fn test_genoa_certificate_chain_validation() {
-        use crate::snp::ProcessorGeneration;
-
         let vendor_certs = CERT_CHAINS
             .get(&ProcessorGeneration::Genoa)
             .expect("Genoa certificate chain should be present");
 
-        let amd_chain = AmdChain {
-            ask: vendor_certs.ask.clone().into(),
-            ark: vendor_certs.ark.clone().into(),
+        let ca_chain = CaChain {
+            ark: vendor_certs.ark.clone(),
+            ask: vendor_certs.ask.clone(),
         };
 
-        amd_chain
-            .validate()
+        ca_chain
+            .verify()
             .expect("Genoa certificate chain should be valid");
     }
 
     #[test]
     fn test_genoa_vcek_validation() {
-        use crate::snp::ProcessorGeneration;
+        let vcek = load_vcek(include_str!("../../test_data/az-snp-vtpm/vcek-genoa.pem"));
 
-        let vcek_pem = include_str!("../../test_data/az-snp-vtpm/vcek-genoa.pem");
-        let vcek = Vcek::from_pem(vcek_pem).expect("Failed to parse Genoa VCEK");
-
-        let vendor_certs = CERT_CHAINS
-            .get(&ProcessorGeneration::Genoa)
-            .expect("Genoa certificate chain should be present");
-
-        let amd_chain = AmdChain {
-            ask: vendor_certs.ask.clone().into(),
-            ark: vendor_certs.ark.clone().into(),
-        };
-
-        amd_chain
-            .validate()
-            .expect("Genoa certificate chain should be valid");
-        vcek.validate(&amd_chain)
+        cert_chain(&ProcessorGeneration::Genoa, &vcek)
+            .verify()
             .expect("Genoa VCEK should validate against Genoa certificate chain");
+        verify_vcek_validity_window(&vcek)
+            .expect("Genoa VCEK should be inside its validity window");
+    }
+
+    /// A self-signed cert whose validity window is the given day offsets from
+    /// now. Built here rather than checked in so the window always straddles
+    /// the current clock and cannot age into the wrong answer.
+    fn cert_valid_between(not_before: i64, not_after: i64) -> Certificate {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let at = |days: i64| Asn1Time::from_unix(now + days * 86_400).unwrap();
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder.set_not_before(&at(not_before)).unwrap();
+        builder.set_not_after(&at(not_after)).unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+
+        Certificate::from_pem(&builder.build().to_pem().unwrap()).unwrap()
+    }
+
+    /// Both reject paths, which the real VCEKs cannot reach while current.
+    #[rstest]
+    #[case::expired(-730, -365)]
+    #[case::not_yet_valid(365, 730)]
+    fn test_vcek_outside_validity_window_rejected(#[case] not_before: i64, #[case] not_after: i64) {
+        assert!(verify_vcek_validity_window(&cert_valid_between(not_before, not_after)).is_err());
     }
 
     #[test]
@@ -616,13 +631,13 @@ mod tests {
         // messing with snp report
         wrong_report[0x01a6] = 0;
         let hcl_report = HclReport::new(wrong_report.to_vec()).unwrap();
-        let snp_report = hcl_report.try_into().unwrap();
-        let vcek = Vcek::from_pem(include_str!("../../test_data/az-snp-vtpm/vcek.pem")).unwrap();
+        let snp_report: AttestationReport = hcl_report.try_into().unwrap();
+        let vcek = load_vcek(include_str!("../../test_data/az-snp-vtpm/vcek.pem"));
         assert_eq!(
-            verify_snp_report(&snp_report, &vcek)
+            verify_snp_report(&snp_report, vcek, MILAN_FIXTURE_GENERATION)
                 .unwrap_err()
                 .to_string(),
-            "SNP version mismatch",
+            "Signature validation failed",
         );
     }
 
