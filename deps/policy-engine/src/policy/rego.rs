@@ -74,7 +74,7 @@ impl Regorus {
 
         let policy_hash = {
             use sha2::Digest;
-            let mut hasher = sha2::Sha384::new();
+            let mut hasher = sha2::Sha256::new(); // Align with sigstore digests
             hasher.update(&policy);
             let hex = hasher.finalize().to_vec();
             hex::encode(hex)

@@ -34,6 +34,9 @@ use crate::TeeClaims;
 pub const TRUST_CLAIMS_RULE: &str = "data.policy.trust_claims";
 /// The policy claim that will hold extensions.
 pub const EXTENSIONS_RULE: &str = "data.policy.extensions";
+/// The appraisal extension holding the SHA-256 of the policy that produced it.
+pub const POLICY_HASH_EXTENSION: &str = "trustee.policy-hash";
+const POLICY_HASH_EXTENSION_KEY: i32 = -71000;
 
 pub struct EarAttestationTokenBroker {
     config: EarTokenConfiguration,
@@ -263,6 +266,16 @@ impl EarAttestationTokenBroker {
 
             // Set extensions from policy result
             let mut extensions = Extensions::new();
+            // Registered before the policy's own, so a policy cannot claim this name.
+            extensions.register(
+                POLICY_HASH_EXTENSION,
+                POLICY_HASH_EXTENSION_KEY,
+                RawValueKind::String,
+            )?;
+            extensions.set_by_name(
+                POLICY_HASH_EXTENSION,
+                RawValue::String(format!("sha256:{}", policy_results.policy_hash)),
+            )?;
             let extension_claims = policy_results
                 .eval_rules_result
                 .get(EXTENSIONS_RULE)
@@ -599,6 +612,21 @@ mod tests {
 
         let ear = Ear::from_jwt(&token, jsonwebtoken::Algorithm::ES256, &public_key).unwrap();
         ear.validate().unwrap();
+
+        let payload: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(token.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let policy = include_bytes!("../../tests/coco-as/policy/opa/ear_no_rv_policy_cpu.rego");
+        assert_eq!(
+            payload["submods"]["cpu0"][POLICY_HASH_EXTENSION],
+            format!(
+                "sha256:{}",
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(policy))
+            ),
+        );
     }
 
     #[tokio::test]
