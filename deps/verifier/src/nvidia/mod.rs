@@ -280,7 +280,10 @@ impl Nvidia {
                     "certificate": device.certificate,
                 }
             ],
-            "claims_version": "3.0"
+            // NRAS can only find the RIMs for some newer drivers (for example 620 on
+            // Blackwell) when asked for claims 4.0; with 3.0 it reports them missing.
+            // NVIDIA's attestation SDK no longer supports requesting 3.0 at all.
+            "claims_version": "4.0"
         });
 
         let client = reqwest::Client::builder()
