@@ -247,10 +247,13 @@ impl Nvidia {
     ) -> Result<(TeeEvidenceParsedClaim, String)> {
         let b64_engine = base64::engine::general_purpose::STANDARD;
 
-        let (tee_class, endpoint) = match device.arch {
-            Architecture::Blackwell => ("gpu", "gpu"),
-            Architecture::Hopper => ("gpu", "gpu"),
-            Architecture::LS10 => ("switch", "switch"),
+        // NRAS can only find the RIMs for some newer GPU drivers (for example 620 on
+        // Blackwell) under GPU claims 4.0, and reports them missing under 3.0. Switch claims
+        // have no 4.0, so switches stay on 3.0, as in NVIDIA's attestation SDK.
+        let (tee_class, endpoint, claims_version) = match device.arch {
+            Architecture::Blackwell => ("gpu", "gpu", "4.0"),
+            Architecture::Hopper => ("gpu", "gpu", "4.0"),
+            Architecture::LS10 => ("switch", "switch", "3.0"),
         };
 
         // Try hex::decode() to see if someone uses the original encoding still.
@@ -280,7 +283,7 @@ impl Nvidia {
                     "certificate": device.certificate,
                 }
             ],
-            "claims_version": "3.0"
+            "claims_version": claims_version
         });
 
         let client = reqwest::Client::builder()
